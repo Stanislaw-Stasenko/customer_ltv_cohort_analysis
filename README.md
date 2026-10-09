@@ -1,5 +1,14 @@
 # Customer LTV & Cohort Analysis Project (Спортивная Платформа)
 
+> ⚠️ **СТАТУС ПРОЕКТА: В АКТИВНОЙ РАЗРАБОТКЕ**  
+> Проект реализуется итеративно. Текущий фокус — завершение аналитического исследования транзакций и развертывание базового DWH-ядра продаж. Остальные модули хранилища находятся в процессе проектирования и будут добавляться пошагово.
+
+---
+
+
+
+# Customer LTV & Cohort Analysis Project (Спортивная Платформа)
+
 Проект посвящен комплексному исследованию пользовательской активности, когортному анализу метрик удержания (Retention Rate) и жизненной ценности (Lifetime Value) платящей аудитории спортивной платформы. 
 
 Проект реализуется итеративно: от разведочного анализа и аудита качества данных (Data Quality) до проектирования корпоративного хранилища данных (DWH).
@@ -140,21 +149,168 @@ having count(*) > 1
    * Решена проблема отсутствия прайс-листа: общая сумма чека была пропорционально распределена между товарами внутри заказа с помощью оконного подсчета `COUNT(*) OVER (PARTITION BY order_id)`.
    * Выстроено разделение финансовых потоков: на базе конструкции `CASE WHEN` операции были разделены на покупки и возвраты со ссылкой на технический справочник `dwh.dim_transaction_types`.
 
-**Итог этапа:** Вся физическая структура DWH успешно развернута в PostgreSQL. Наличие суррогатных числовых ключей и атомарных строк товаров позволило сократить время выполнения аналитических запросов в десятки раз и подготовить базу для мгновенного построения BI-витрин.
-### Пример трансформации данных слоя RAW в слой DWH
+### 🔄 Пример трансформации данных (Data Transformation: RAW to DWH)
 
-**Сырые данные (Таблица `raw.raw_transactions`):**
+Для наглядности приведем пример того, как «грязная» текстовая строка из сырого лога транзакций трансформируется внутри СУБД PostgreSQL и раскладывается на атомарные аналитические строки в слое DWH:
 
-| client_uuid | trans_date | amount | product_list |
-| :--- | :--- | :--- | :--- |
-| e7e5b924... | 2026-03-03 01:31:16 | 5544.49 | Tshirt,Jacket |
+**1. Как данные выглядели в сыром слое (`raw.raw_transactions`):**
+*Здесь нет номеров чеков, товары лежат кашей в одной ячейке, а сумма указана за всё событие целиком.*
 
-**Очищенные данные хранилища (Таблица `dwh.f_order_items`):**
+| client_uuid | trans_date | amount | product_list | channel |
+| :--- | :--- | :--- | :--- | :--- |
+| e7e5b924-4109-48d3-adc0-d99ae6505492 | 2026-03-03 01:31:16 | 5544.49 | Tshirt,Jacket | offline |
 
-| id | order_id | user_id | product_id | transaction_type_id | allocated_amount |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 1 | 150 | 42 | 5 (Tshirt) | 1 (Покупка) | 2772.25 |
-| 2 | 150 | 42 | 8 (Jacket) | 1 (Покупка) | 2772.25 |
+**2. Как эти же данные легли в разработанную таблицу фактов хранилища (`dwh.f_order_items`):**
+*Сгенерирован единый `order_id` для чека, UUID заменен на числовой `user_id` из справочника, список товаров разделен на отдельные строки, а сумма чека честно распределилась пропорционально количеству товаров.*
+
+| id | order_id | user_id | product_id | transaction_type_id | allocated_amount | trans_date | channel |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | 150 | 42 | 3 *(Tshirt)* | 1 *(Покупка)* | **2772.25** | 2026-03-03 01:31:16 | offline |
+| **2** | 150 | 42 | 7 *(Jacket)* | 1 *(Покупка)* | **2772.25** | 2026-03-03 01:31:16 | offline |
+
+---
+
+
+---
+
+### 💻 Исходный SQL-код развертывания DWH слоя (DDL & ELT)
+
+Ниже представлены рабочие SQL-скрипты, с помощью которых была развернута физическая структура хранилища в PostgreSQL и осуществлена миграция данных.
+
+<details>
+<summary>🔍 1. Скрипт создания схем и справочников (DDL)</summary>
+
+```sql
+-- Создание изолированных слоев хранилища
+CREATE SCHEMA IF NOT EXISTS raw;
+CREATE SCHEMA IF NOT EXISTS dwh;
+
+-- Справочник пользователей
+CREATE TABLE dwh.dim_users (
+    user_id SERIAL PRIMARY KEY,
+    client_uuid uuid NOT NULL,
+    cohort_month DATE NOT NULL
+);
+
+-- Справочник товаров
+CREATE TABLE dwh.dim_products (
+    product_id SERIAL PRIMARY KEY,
+    product_name VARCHAR(255) NOT NULL
+);
+
+-- Справочник типов операций
+CREATE TABLE dwh.dim_transaction_types (
+    transaction_type_id SERIAL PRIMARY KEY,
+    type_name VARCHAR(50) NOT NULL
+);
+
+-- Наполнение справочника типов операций базовыми значениями
+INSERT INTO dwh.dim_transaction_types (type_name) VALUES ('Покупка'), ('Возврат');
+```
+</details>
+
+<details>
+<summary>🔍 2. Скрипт наполнения таблицы фактов и пропорционального деления выручки (ELT)</summary>
+
+```sql
+-- Создание таблицы фактов f_order_items
+CREATE TABLE dwh.f_order_items (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER,
+    user_id INTEGER,
+    product_id INTEGER,
+    transaction_type_id INTEGER NOT NULL,
+    allocated_amount NUMERIC(10,2),
+    trans_date TIMESTAMP,
+    promo_code VARCHAR(20),
+    channel VARCHAR(20)
+);
+
+-- Очищаем таблицу перед полной перегрузкой 
+TRUNCATE TABLE dwh.f_order_items;
+
+-- Запуск процесса трансформации и миграции данных
+INSERT INTO dwh.f_order_items (order_id, user_id, product_id, transaction_type_id, allocated_amount, trans_date, promo_code, channel)
+WITH parsed_products AS (
+    SELECT
+        DENSE_RANK() OVER (ORDER BY client_uuid, trans_date) AS order_id,
+        client_uuid::uuid,
+        trans_date::date AS trans_date,
+        NULLIF(amount, 'error')::NUMERIC AS amount,
+        STRING_TO_TABLE(product_list, ',') AS product,
+        promo_code,
+        channel
+    FROM raw.raw_transactions
+),
+prepared_transactions AS (
+    SELECT
+        order_id,
+        client_uuid,
+        trans_date,
+        -- Распределение суммы чека на количество товаров в заказе
+        amount / COUNT(*) OVER (PARTITION BY order_id) AS allocated_amount,
+        product,
+        promo_code,
+        channel
+    FROM parsed_products    
+)
+SELECT
+    pt.order_id,
+    du.user_id,
+    di.product_id,
+    CASE WHEN pt.allocated_amount < 0 THEN 2 ELSE 1 END AS transaction_type_id,
+    pt.allocated_amount,
+    pt.trans_date,
+    pt.promo_code,
+    pt.channel
+FROM prepared_transactions pt
+INNER JOIN dwh.dim_users du ON du.client_uuid = pt.client_uuid
+INNER JOIN dwh.dim_products di ON di.product = pt.product_name;
+```
+</details>
+
+<details>
+<summary>🔍 3. Финальный высокопроизводительный аналитический запрос (Витрина LTV/Retention)</summary>
+
+```sql
+WITH preliminary_table AS ( 
+    SELECT
+        du.cohort_month,
+        oi.order_id,
+        oi.allocated_amount AS amount,
+        -- Математически точный расчет месяцев жизни с учетом кросс-годовых смещений
+        (EXTRACT(YEAR FROM oi.trans_date::date) * 12 + EXTRACT(MONTH FROM oi.trans_date::date))
+        -
+        (EXTRACT(YEAR FROM du.cohort_month) * 12 + EXTRACT(MONTH FROM du.cohort_month)) AS month_life,
+        oi.user_id
+    FROM dwh.f_order_items oi
+    INNER JOIN dwh.dim_users du ON oi.user_id = du.user_id
+    WHERE oi.transaction_type_id = 1
+)
+SELECT
+    cohort_month,
+    month_life,
+    SUM(amount) AS amount,
+    COUNT(DISTINCT user_id) AS user_count,
+    -- Расчет кумулятивного LTV в один проход
+    ROUND(
+        SUM(SUM(amount)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC)
+        /
+        FIRST_VALUE(COUNT(DISTINCT user_id)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC), 
+        0
+    ) AS ltv_cumulative,
+    -- Расчет корректного Retention Rate
+    ROUND(
+        COUNT(DISTINCT user_id) * 100.0
+        /
+        FIRST_VALUE(COUNT(DISTINCT user_id)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC), 
+        2
+    ) AS retention_rate
+FROM preliminary_table
+GROUP BY cohort_month, month_life
+ORDER BY cohort_month, month_life ASC;
+```
+</details>
 ---
 
 ## 🛠 Технологический стек
