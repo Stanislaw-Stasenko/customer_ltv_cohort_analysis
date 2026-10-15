@@ -278,37 +278,125 @@ WITH preliminary_table AS (
         du.cohort_month,
         oi.order_id,
         oi.allocated_amount AS amount,
-        -- Математически точный расчет месяцев жизни с учетом кросс-годовых смещений
+        -- Считаем чистый возраст когорты в месяцах с учетом переходов через границы календарных годов
         (EXTRACT(YEAR FROM oi.trans_date::date) * 12 + EXTRACT(MONTH FROM oi.trans_date::date))
         -
         (EXTRACT(YEAR FROM du.cohort_month) * 12 + EXTRACT(MONTH FROM du.cohort_month)) AS month_life,
-        oi.user_id
+        oi.user_id,
+        -- Заменяем NULL/None в каналах на понятную строку, чтобы не потерять транзакции при последующих JOIN
+        COALESCE(oi.channel, 'Unknown') AS channel
     FROM dwh.f_order_items oi
     INNER JOIN dwh.dim_users du ON oi.user_id = du.user_id
     WHERE oi.transaction_type_id = 1
+),
+
+-- Шаг 1: Извлекаем базис когорт из очищенного справочника клиентов
+all_cohorts AS (
+    SELECT DISTINCT cohort_month FROM dwh.dim_users
+),
+
+-- Шаг 2: Генерируем фиксированный шаг жизненного цикла, чтобы сетка отчета не обрывалась раньше времени
+all_months AS (
+    SELECT generate_series(0, 20) AS month_life
+),
+
+-- Шаг 3: Собираем уникальный список каналов для многомерного анализа
+all_channel AS (
+    SELECT DISTINCT COALESCE(channel, 'Unknown') AS channel FROM dwh.f_order_items
+),
+
+-- Шаг 4: Строим идеальное декартово пространство (CROSS JOIN). 
+-- Каждая когорта гарантированно получит строки под каждый месяц жизни и каждый источник трафика.
+grid AS (
+    SELECT
+        c.cohort_month,
+        m.month_life,
+        a.channel
+    FROM all_cohorts c
+    CROSS JOIN all_months m 
+    CROSS JOIN all_channel a
+),
+
+-- Шаг 5: Сворачиваем сырые продажи до нужного уровня гранулярности: месяц-жизни + когорта + канал
+aggregated_actual AS (
+    SELECT
+        cohort_month,
+        month_life,
+        channel,
+        SUM(amount) AS amount,
+        COUNT(DISTINCT user_id) AS user_count
+    FROM preliminary_table 
+    GROUP BY cohort_month, month_life, channel
+),
+
+-- Шаг 6: Накапливаем сырые финансовые агрегаты поверх пустой сетки grid.
+calculated_metrics AS (
+    SELECT
+        g.cohort_month,
+        g.month_life,
+        g.channel,
+        COALESCE(aa.amount, 0) AS amount,
+        COALESCE(aa.user_count, 0) AS user_count,
+        
+        -- Считаем непрерывный нарастающий итог выручки строго внутри связки «Когорта + Канал»
+        SUM(COALESCE(aa.amount, 0)) OVER (
+            PARTITION BY g.cohort_month, g.channel 
+            ORDER BY g.month_life ASC
+        ) AS running_amount,
+        
+        -- Фиксируем стартовый (максимальный) объем когорты для конкретного источника. 
+        -- Это наш будущий делитель для LTV и Retention.
+        MAX(COALESCE(aa.user_count, 0)) OVER (
+            PARTITION BY g.cohort_month, g.channel
+        ) AS cohort_size,
+        
+        -- Считаем сырое удержание. NULLIF страхует от падения базы, если в когорте на старте будет 0.
+        COALESCE(aa.user_count, 0) * 100.0 / NULLIF(
+            MAX(COALESCE(aa.user_count, 0)) OVER (PARTITION BY g.cohort_month, g.channel), 
+            0
+        ) AS raw_retention
+    FROM grid g
+    LEFT JOIN aggregated_actual aa 
+        ON g.cohort_month = aa.cohort_month
+        AND g.month_life = aa.month_life
+        AND g.channel = aa.channel
 )
+
+-- Финальный SELECT: Не делим метрики здесь, а отдаем сырые агрегаты в DataLens.
+-- Это решает "ловушку гранулярности" в BI: при сбросе фильтров проценты не будут ломаться.
 SELECT
     cohort_month,
     month_life,
-    SUM(amount) AS amount,
-    COUNT(DISTINCT user_id) AS user_count,
-    -- Расчет кумулятивного LTV в один проход
-    ROUND(
-        SUM(SUM(amount)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC)
-        /
-        FIRST_VALUE(COUNT(DISTINCT user_id)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC), 
-        0
-    ) AS ltv_cumulative,
-    -- Расчет корректного Retention Rate
-    ROUND(
-        COUNT(DISTINCT user_id) * 100.0
-        /
-        FIRST_VALUE(COUNT(DISTINCT user_id)) OVER (PARTITION BY cohort_month ORDER BY month_life ASC), 
-        2
-    ) AS retention_rate
-FROM preliminary_table
-GROUP BY cohort_month, month_life
-ORDER BY cohort_month, month_life ASC;
+    channel,
+    amount,
+    
+    -- Динамический фильтр CURRENT_DATE + AGE: если месяц жизни уходит "в будущее", 
+    -- принудительно возвращаем NULL. Это затрет лишние хвосты в таблицах и на графиках.
+    CASE 
+        WHEN month_life > (EXTRACT(YEAR FROM AGE(CURRENT_DATE, cohort_month)) * 12 + EXTRACT(MONTH FROM AGE(CURRENT_DATE, cohort_month))) THEN NULL
+        WHEN cohort_size = 0 THEN NULL 
+        ELSE cohort_size
+    END AS cohort_size,
+    
+    CASE 
+        WHEN month_life > (EXTRACT(YEAR FROM AGE(CURRENT_DATE, cohort_month)) * 12 + EXTRACT(MONTH FROM AGE(CURRENT_DATE, cohort_month))) THEN NULL
+        WHEN user_count = 0 THEN NULL 
+        ELSE user_count
+    END AS final_user_count,
+    
+    CASE 
+        WHEN month_life > (EXTRACT(YEAR FROM AGE(CURRENT_DATE, cohort_month)) * 12 + EXTRACT(MONTH FROM AGE(CURRENT_DATE, cohort_month))) THEN NULL
+        WHEN running_amount = 0 THEN NULL 
+        ELSE running_amount
+    END AS ltv_cumulative, 
+    
+    CASE 
+        WHEN month_life > (EXTRACT(YEAR FROM AGE(CURRENT_DATE, cohort_month)) * 12 + EXTRACT(MONTH FROM AGE(CURRENT_DATE, cohort_month))) THEN NULL
+        WHEN raw_retention = 0 THEN NULL 
+        ELSE round(raw_retention, 0) 
+    END AS retention
+FROM calculated_metrics
+ORDER BY cohort_month, month_life, channel ASC;
 ```
 </details>
 ---
